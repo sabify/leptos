@@ -28,6 +28,56 @@ impl Error {
     pub fn into_inner(self) -> Arc<dyn error::Error + Send + Sync> {
         Arc::clone(&self.0)
     }
+
+    /// Attempts to downcast the inner error to a specific `ServerFnError<E>` type and returns a reference to its inner error.
+    ///
+    /// This method tries to downcast the underlying error to `ServerFnError<E>`, and if successful,
+    /// returns a reference to the inner error of type `E`.
+    ///
+    /// If `ServerFnError::WrappedServerError<E>` variant (custom errors) is not your case, use `error.downcast_ref::<ServerFnError>()`.
+    ///
+    /// # Type Parameters
+    ///
+    /// * `E`: The type of the custom error, which must implement `std::error::Error`.
+    ///
+    /// # Returns
+    ///
+    /// * `Some(&E)` if the underlying error is a `ServerFnError<E>` containing an error of type `E`.
+    /// * `None` if the underlying error is not a `ServerFnError<E>` or doesn't contain an error of type `E`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use server_fn::error::{Error, ServerFnError};
+    /// # use std::{error::Error as StdError, fmt};
+    /// # #[derive(Debug, PartialEq, Clone)]
+    /// # struct CustomError(String);
+    /// # impl fmt::Display for CustomError {
+    /// #     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    /// #         write!(f, "CustomError: {}", self.0)
+    /// #     }
+    /// # }
+    /// # impl StdError for CustomError {}
+    /// let custom_error = CustomError("test error".to_string());
+    /// let server_fn_error: ServerFnError<CustomError> =
+    ///     ServerFnError::WrappedServerError(custom_error.clone());
+    /// let error: Error = server_fn_error.into();
+    /// assert_eq!(
+    ///     error.get_server_fn_error::<CustomError>(),
+    ///     Some(&custom_error)
+    /// );
+    /// ```
+    pub fn get_server_fn_error<E: std::error::Error + 'static>(
+        &self,
+    ) -> Option<&E> {
+        if let Some(ServerFnError::WrappedServerError(inner)) =
+            self.0.downcast_ref::<ServerFnError<E>>()
+        {
+            Some(inner)
+        } else {
+            None
+        }
+    }
 }
 
 impl ops::Deref for Error {
