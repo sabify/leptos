@@ -433,7 +433,7 @@ dependencies = [
  "serde_urlencoded",
  "sync_wrapper 1.0.1",
  "tokio",
- "tower 0.5.1",
+ "tower",
  "tower-layer",
  "tower-service",
  "tracing",
@@ -1873,7 +1873,7 @@ dependencies = [
  "parking_lot",
  "server_fn",
  "tokio",
- "tower 0.4.13",
+ "tower",
  "tower-http",
  "tracing",
 ]
@@ -3329,7 +3329,7 @@ dependencies = [
  "server_fn_macro_default",
  "thiserror",
  "throw_error",
- "tower 0.4.13",
+ "tower",
  "tower-layer",
  "url",
  "wasm-bindgen",
@@ -3857,21 +3857,6 @@ dependencies = [
  "serde_spanned",
  "toml_datetime",
  "winnow",
-]
-
-[[package]]
-name = "tower"
-version = "0.4.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8fa9be0de6cf49e536ce1851f987bd21a43b771b09473c3549a6c853db37c1c"
-dependencies = [
- "futures-core",
- "futures-util",
- "pin-project",
- "pin-project-lite",
- "tower-layer",
- "tower-service",
- "tracing",
 ]
 
 [[package]]
