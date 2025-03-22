@@ -11,7 +11,7 @@ use reactive_graph::{
 };
 use tachys::prelude::*;
 
-/// A component that will show its children when the `when` condition is `true`.
+/// A component that will show its children  when the `when` condition is `true`.
 /// Additionally, you need to specify a `hide_delay`. If the `when` condition changes to `false`,
 /// the unmounting of the children will be delayed by the specified Duration.
 /// If you provide the optional `show_class` and `hide_class`, you can create very easy mount /
