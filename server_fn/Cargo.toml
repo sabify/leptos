@@ -40,7 +40,7 @@ tower = { version = "0.5.1", optional = true }
 tower-layer = { version = "0.3.3", optional = true }
 
 ## input encodings
-serde_qs = { version = "0.13.0" }
+serde_qs = { version = "0.14.0" }
 multer = { version = "3.1", optional = true }
 
 ## output encodings
@@ -79,8 +79,8 @@ reqwest = { version = "0.12.9", default-features = false, optional = true, featu
 ] }
 tokio-tungstenite = { version = "0.26.2", optional = true }
 url = "2"
-pin-project-lite = "0.2.15"
-tokio = { version = "1.43.0", features = ["rt"], optional = true }
+pin-project-lite = "0.2.16"
+tokio = { version = "1.44", features = ["rt"], optional = true }
 
 [dev-dependencies]
 trybuild = { workspace = true }
