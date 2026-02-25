@@ -119,7 +119,7 @@ serde-lite = { default-features = false, version = "0.5" }
 tokio-tungstenite = { default-features = false, version = "0.28" }
 serial_test = { default-features = false, version = "3.4" }
 erased = { default-features = false, version = "0.1" }
-glib = { default-features = false, version = "0.21" }
+glib = { default-features = false, version = "0.22" }
 async-trait = { default-features = false, version = "0.1" }
 anyhow = { default-features = false, version = "1.0" }
 walkdir = { default-features = false, version = "2.5" }
