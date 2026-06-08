@@ -67,13 +67,12 @@ pub fn location_hash() -> Option<String> {
     if is_server() {
         None
     } else {
-        location()
-            .hash()
-            .ok()
-            .map(|hash| match hash.chars().next() {
-                Some('#') => hash[1..].to_string(),
-                _ => hash,
-            })
+        location().hash().ok().map(|mut hash| {
+            if hash.starts_with('#') {
+                hash.drain(..1);
+            }
+            hash
+        })
     }
 }
 
