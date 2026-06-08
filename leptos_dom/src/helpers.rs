@@ -58,7 +58,7 @@ pub fn get_property(
 
 /// Returns the current [`window.location`](https://developer.mozilla.org/en-US/docs/Web/API/Window/location).
 pub fn location() -> web_sys::Location {
-    window().location()
+    WINDOW.with(|w| w.location())
 }
 
 /// Current [`window.location.hash`](https://developer.mozilla.org/en-US/docs/Web/API/Window/location)
@@ -125,7 +125,7 @@ impl AnimationFrameRequestHandle {
     /// Cancels the animation frame request to which this refers.
     /// See [`cancelAnimationFrame()`](https://developer.mozilla.org/en-US/docs/Web/API/Window/cancelAnimationFrame)
     pub fn cancel(&self) {
-        _ = window().cancel_animation_frame(self.0);
+        _ = WINDOW.with(|w| w.cancel_animation_frame(self.0));
     }
 }
 
@@ -170,9 +170,10 @@ pub fn request_animation_frame(
 
     #[inline(never)]
     fn raf(cb: JsValue) -> Result<AnimationFrameRequestHandle, JsValue> {
-        window()
-            .request_animation_frame(cb.as_ref().unchecked_ref())
-            .map(AnimationFrameRequestHandle)
+        WINDOW.with(|w| {
+            w.request_animation_frame(cb.as_ref().unchecked_ref())
+                .map(AnimationFrameRequestHandle)
+        })
     }
 
     raf(closure_once(cb))
@@ -187,7 +188,7 @@ impl IdleCallbackHandle {
     /// Cancels the idle callback to which this refers.
     /// See [`cancelAnimationFrame()`](https://developer.mozilla.org/en-US/docs/Web/API/Window/cancelIdleCallback)
     pub fn cancel(&self) {
-        window().cancel_idle_callback(self.0);
+        WINDOW.with(|w| w.cancel_idle_callback(self.0));
     }
 }
 
@@ -215,9 +216,10 @@ pub fn request_idle_callback(
     fn ric(cb: Box<dyn Fn()>) -> Result<IdleCallbackHandle, JsValue> {
         let cb = Closure::wrap(cb).into_js_value();
 
-        window()
-            .request_idle_callback(cb.as_ref().unchecked_ref())
-            .map(IdleCallbackHandle)
+        WINDOW.with(|w| {
+            w.request_idle_callback(cb.as_ref().unchecked_ref())
+                .map(IdleCallbackHandle)
+        })
     }
 
     ric(Box::new(cb))
@@ -245,7 +247,7 @@ impl TimeoutHandle {
     /// Cancels the timeout to which this refers.
     /// See [`clearTimeout()`](https://developer.mozilla.org/en-US/docs/Web/API/clearTimeout)
     pub fn clear(&self) {
-        window().clear_timeout_with_handle(self.0);
+        WINDOW.with(|w| w.clear_timeout_with_handle(self.0));
     }
 }
 
@@ -280,12 +282,13 @@ pub fn set_timeout(
 
     #[inline(never)]
     fn st(cb: JsValue, duration: Duration) -> Result<TimeoutHandle, JsValue> {
-        window()
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
+        WINDOW.with(|w| {
+            w.set_timeout_with_callback_and_timeout_and_arguments_0(
                 cb.as_ref().unchecked_ref(),
                 duration.as_millis().try_into().unwrap_throw(),
             )
             .map(TimeoutHandle)
+        })
     }
 
     st(closure_once(cb), duration)
@@ -376,7 +379,7 @@ impl IntervalHandle {
     /// Cancels the repeating event to which this refers.
     /// See [`clearInterval()`](https://developer.mozilla.org/en-US/docs/Web/API/clearInterval)
     pub fn clear(&self) {
-        window().clear_interval_with_handle(self.0);
+        WINDOW.with(|w| w.clear_interval_with_handle(self.0));
     }
 }
 
@@ -416,12 +419,13 @@ pub fn set_interval(
     ) -> Result<IntervalHandle, JsValue> {
         let cb = Closure::wrap(cb).into_js_value();
 
-        window()
-            .set_interval_with_callback_and_timeout_and_arguments_0(
+        WINDOW.with(|w| {
+            w.set_interval_with_callback_and_timeout_and_arguments_0(
                 cb.as_ref().unchecked_ref(),
                 duration.as_millis().try_into().unwrap_throw(),
             )
             .map(IntervalHandle)
+        })
     }
 
     si(Box::new(cb), duration)
@@ -462,17 +466,21 @@ pub fn window_event_listener_untyped(
             event_name: &str,
         ) -> WindowListenerHandle {
             let cb = Closure::wrap(cb).into_js_value();
-            _ = window().add_event_listener_with_callback(
-                event_name,
-                cb.unchecked_ref(),
-            );
+            _ = WINDOW.with(|w| {
+                w.add_event_listener_with_callback(
+                    event_name,
+                    cb.unchecked_ref(),
+                )
+            });
             let event_name = event_name.to_string();
             let cb = SendWrapper::new(cb);
             WindowListenerHandle(Box::new(move || {
-                _ = window().remove_event_listener_with_callback(
-                    &event_name,
-                    cb.unchecked_ref(),
-                );
+                _ = WINDOW.with(|w| {
+                    w.remove_event_listener_with_callback(
+                        &event_name,
+                        cb.unchecked_ref(),
+                    )
+                });
             }))
         }
 
