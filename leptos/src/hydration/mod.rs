@@ -76,7 +76,7 @@ pub fn HydrationScripts(
                 .expect("failed to read hash file");
 
             let mut split =
-                "__wasm_split.______________________.js".to_string();
+                "__wasm_split.js".to_string();
             let mut manifest = "__wasm_split_manifest.json".to_string();
             for line in hashes.lines() {
                 let line = line.trim();
@@ -100,7 +100,7 @@ pub fn HydrationScripts(
             (split, manifest)
         } else {
             (
-                "__wasm_split.______________________.js".to_string(),
+                "__wasm_split.js".to_string(),
                 "__wasm_split_manifest.json".to_string(),
             )
         };
