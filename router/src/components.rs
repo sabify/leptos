@@ -14,21 +14,35 @@ use crate::{
     nested_router::NestedRoutesView,
     resolve_path::resolve_path,
 };
-use either_of::EitherOf3;
+use either_of::{Either, EitherOf3};
+use futures::task::{ArcWake, AtomicWaker, waker};
 use leptos::{children, prelude::*};
+use or_poisoned::OrPoisoned;
 use reactive_graph::{
+    computed::suspense::SuspenseContext,
+    graph::{
+        AnySource, AnySubscriber, ReactiveNode, Source, Subscriber,
+        WithObserver,
+    },
     owner::{Owner, provide_context, use_context},
     signal::ArcRwSignal,
     traits::{GetUntracked, ReadUntracked, Set},
+    transition::AsyncTransition,
     wrappers::write::SignalSetter,
 };
 use std::{
     borrow::Cow,
     fmt::{Debug, Display},
+    future::poll_fn,
     mem,
-    sync::Arc,
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::Poll,
     time::Duration,
 };
+use tachys::reactive_graph::OwnedView;
 
 /// A wrapper that allows passing route definitions as children to a component like [`Routes`],
 /// [`FlatRoutes`], [`ParentRoute`], or [`ProtectedParentRoute`].
@@ -57,6 +71,12 @@ pub fn Router<Chil>(
     #[prop(optional, into)]
     base: Option<Cow<'static, str>>,
     /// A signal that will be set while the navigation process is underway.
+    ///
+    /// With it, a client-side navigation keeps the previous page on screen until the new
+    /// route's view has been created and the resources it created while doing so have loaded;
+    /// for a [`ProtectedRoute`], that includes waiting for its `condition` to allow access.
+    /// Content that only starts loading once the new page is shown (inside a `Suspend`, for
+    /// example) shows its own fallback instead.
     #[prop(optional, into)]
     set_is_routing: Option<SignalSetter<bool>>,
     // TODO trailing slashes
@@ -380,172 +400,435 @@ where
         .into_maybe_erased()
 }
 
-/// With the `impl Fn` in the return signature, IntoMaybeErased::Output isn't accepted by the compiler, so changing return type depending on the erasure flag.
-macro_rules! define_protected_route {
-    ($ret:ty) => {
-        /// Describes a route that is guarded by a certain condition. This works the same way as
-        /// [`<Route/>`], except that if the `condition` function evaluates to `Some(false)`, it
-        /// redirects to `redirect_path` instead of displaying its `view`.
-        #[component(transparent)]
-        pub fn ProtectedRoute<Segments, ViewFn, View, C, PathFn, P>(
-            /// The path fragment that this route should match. This can be created using the
-            /// [`path`](crate::path) macro, or path segments ([`StaticSegment`](crate::StaticSegment),
-            /// [`ParamSegment`](crate::ParamSegment), [`WildcardSegment`](crate::WildcardSegment), and
-            /// [`OptionalParamSegment`](crate::OptionalParamSegment)).
-            path: Segments,
-            /// The view for this route.
-            view: ViewFn,
-            /// A function that returns `Option<bool>`, where `Some(true)` means that the user can access
-            /// the page, `Some(false)` means the user cannot access the page, and `None` means this
-            /// information is still loading.
-            condition: C,
-            /// The path that will be redirected to if the condition is `Some(false)`.
-            redirect_path: PathFn,
-            /// Will be displayed while the condition is pending. By default this is the empty view.
-            #[prop(optional, into)]
-            fallback: children::ViewFn,
-            /// The mode that this route prefers during server-side rendering.
-            /// Defaults to out-of-order streaming.
-            #[prop(optional)]
-            ssr: SsrMode,
-        ) -> $ret
-        where
-            Segments: PossibleRouteMatch + Clone + Send + 'static,
-            ViewFn: Fn() -> View + Send + Clone + 'static,
-            View: IntoView + 'static,
-            C: Fn() -> Option<bool> + Send + Clone + 'static,
-            PathFn: Fn() -> P + Send + Clone + 'static,
-            P: Display + 'static,
-        {
-            let fallback = move || fallback.run();
-            let view = move || {
-                let condition = condition.clone();
-                let redirect_path = redirect_path.clone();
-                let view = view.clone();
-                let fallback = fallback.clone();
-                (view! {
-                    <Transition fallback=fallback.clone()>
-                        {move || {
-                            let condition = condition();
-                            let view = view.clone();
-                            let redirect_path = redirect_path.clone();
-                            let fallback = fallback.clone();
-                            Unsuspend::new(move || match condition {
-                                Some(true) => EitherOf3::A(view()),
-                                #[allow(clippy::unit_arg)]
-                                Some(false) => {
-                                    EitherOf3::B(view! { <Redirect path=redirect_path()/> }.into_inner())
-                                }
-                                None => EitherOf3::C(fallback()),
-                            })
-                        }}
-
-                    </Transition>
-                })
-                .into_any()
-            };
-            NestedRoute::new(path, view).ssr_mode(ssr).into_maybe_erased()
-        }
+/// Describes a route that is guarded by a certain condition. This works the same way as
+/// [`<Route/>`], except that if the `condition` function evaluates to `Some(false)`, it
+/// redirects to `redirect_path` instead of displaying its `view`.
+///
+/// With [`<Router set_is_routing>`](Router), a navigation to this route keeps the previous
+/// page on screen, as it does for a [`<Route/>`], until the `view` has been created and the
+/// resources it creates have loaded: it waits for `condition` to allow access first, if
+/// `condition` reads a resource that is still loading. A `condition` that is `None` without
+/// waiting for a resource cannot be waited for: the route then shows its `fallback`.
+#[component(transparent)]
+pub fn ProtectedRoute<Segments, ViewFn, View, C, PathFn, P>(
+    /// The path fragment that this route should match. This can be created using the
+    /// [`path`](crate::path) macro, or path segments ([`StaticSegment`](crate::StaticSegment),
+    /// [`ParamSegment`](crate::ParamSegment), [`WildcardSegment`](crate::WildcardSegment), and
+    /// [`OptionalParamSegment`](crate::OptionalParamSegment)).
+    path: Segments,
+    /// The view for this route.
+    view: ViewFn,
+    /// A function that returns `Option<bool>`, where `Some(true)` means that the user can access
+    /// the page, `Some(false)` means the user cannot access the page, and `None` means this
+    /// information is still loading.
+    condition: C,
+    /// The path that will be redirected to if the condition is `Some(false)`.
+    redirect_path: PathFn,
+    /// Will be displayed while the condition is pending. By default this is the empty view.
+    #[prop(optional, into)]
+    fallback: children::ViewFn,
+    /// The mode that this route prefers during server-side rendering.
+    /// Defaults to out-of-order streaming.
+    #[prop(optional)]
+    ssr: SsrMode,
+) -> ProtectedRouteOutput<Segments, (), ViewFn, C, PathFn>
+where
+    Segments: PossibleRouteMatch + Clone + Send + 'static,
+    ViewFn: Fn() -> View + Send + Clone + 'static,
+    View: IntoView + 'static,
+    C: Fn() -> Option<bool> + Send + Clone + 'static,
+    PathFn: Fn() -> P + Send + Clone + 'static,
+    P: Display + 'static,
+{
+    let view = ProtectedRouteView {
+        view,
+        condition,
+        redirect_path,
+        fallback,
+        parent: false,
     };
+    NestedRoute::new(path, view)
+        .ssr_mode(ssr)
+        .into_maybe_erased()
 }
 
-#[cfg(erase_components)]
-define_protected_route!(crate::any_nested_route::AnyNestedRoute);
-#[cfg(not(erase_components))]
-define_protected_route!(NestedRoute<Segments, (), (), impl Fn() -> AnyView + Send + Clone>);
+/// Describes a route with nested child routes that is guarded by a certain condition. This
+/// works the same way as [`<ParentRoute/>`](ParentRoute), except that if the `condition`
+/// function evaluates to `Some(false)`, it redirects to `redirect_path` instead of displaying
+/// its `view`.
+///
+/// With [`<Router set_is_routing>`](Router), a navigation to this route waits for `condition`
+/// and for its `view` like a [`<ProtectedRoute/>`] does.
+#[component(transparent)]
+pub fn ProtectedParentRoute<Segments, ViewFn, View, C, PathFn, P, Children>(
+    /// The path fragment that this route should match. This can be created using the
+    /// [`path`](crate::path) macro, or path segments ([`StaticSegment`](crate::StaticSegment),
+    /// [`ParamSegment`](crate::ParamSegment), [`WildcardSegment`](crate::WildcardSegment), and
+    /// [`OptionalParamSegment`](crate::OptionalParamSegment)).
+    path: Segments,
+    /// The view for this route.
+    view: ViewFn,
+    /// A function that returns `Option<bool>`, where `Some(true)` means that the user can access
+    /// the page, `Some(false)` means the user cannot access the page, and `None` means this
+    /// information is still loading.
+    condition: C,
+    /// Will be displayed while the condition is pending. By default this is the empty view.
+    #[prop(optional, into)]
+    fallback: children::ViewFn,
+    /// The path that will be redirected to if the condition is `Some(false)`.
+    redirect_path: PathFn,
+    /// Nested child routes.
+    children: RouteChildren<Children>,
+    /// The mode that this route prefers during server-side rendering.
+    /// Defaults to out-of-order streaming.
+    #[prop(optional)]
+    ssr: SsrMode,
+) -> ProtectedRouteOutput<Segments, Children, ViewFn, C, PathFn>
+where
+    Segments: PossibleRouteMatch + Clone + Send + 'static,
+    Children: MatchNestedRoutes + Send + Clone + 'static,
+    ViewFn: Fn() -> View + Send + Clone + 'static,
+    View: IntoView + 'static,
+    C: Fn() -> Option<bool> + Send + Clone + 'static,
+    PathFn: Fn() -> P + Send + Clone + 'static,
+    P: Display + 'static,
+{
+    let children = children.into_inner();
+    let view = ProtectedRouteView {
+        view,
+        condition,
+        redirect_path,
+        fallback,
+        parent: true,
+    };
+    NestedRoute::new(path, view)
+        .ssr_mode(ssr)
+        .child(children)
+        .into_maybe_erased()
+}
 
-/// With the `impl Fn` in the return signature, IntoMaybeErased::Output isn't accepted by the compiler, so changing return type depending on the erasure flag.
-macro_rules! define_protected_parent_route {
-    ($ret:ty) => {
-        #[component(transparent)]
-        pub fn ProtectedParentRoute<
-            Segments,
-            ViewFn,
-            View,
-            C,
-            PathFn,
-            P,
-            Children,
-        >(
-            /// The path fragment that this route should match. This can be created using the
-            /// [`path`](crate::path) macro, or path segments ([`StaticSegment`](crate::StaticSegment),
-            /// [`ParamSegment`](crate::ParamSegment), [`WildcardSegment`](crate::WildcardSegment), and
-            /// [`OptionalParamSegment`](crate::OptionalParamSegment)).
-            path: Segments,
-            /// The view for this route.
-            view: ViewFn,
-            /// A function that returns `Option<bool>`, where `Some(true)` means that the user can access
-            /// the page, `Some(false)` means the user cannot access the page, and `None` means this
-            /// information is still loading.
-            condition: C,
-            /// Will be displayed while the condition is pending. By default this is the empty view.
-            #[prop(optional, into)]
-            fallback: children::ViewFn,
-            /// The path that will be redirected to if the condition is `Some(false)`.
-            redirect_path: PathFn,
-            /// Nested child routes.
-            children: RouteChildren<Children>,
-            /// The mode that this route prefers during server-side rendering.
-            /// Defaults to out-of-order streaming.
-            #[prop(optional)]
-            ssr: SsrMode,
-        ) -> $ret
-        where
-            Segments: PossibleRouteMatch + Clone + Send + 'static,
-            Children: MatchNestedRoutes + Send + Clone + 'static,
-            ViewFn: Fn() -> View + Send + Clone + 'static,
-            View: IntoView + 'static,
-            C: Fn() -> Option<bool> + Send + Clone + 'static,
-            PathFn: Fn() -> P + Send + Clone + 'static,
-            P: Display + 'static,
+/// The route that [`ProtectedRoute`] and [`ProtectedParentRoute`] describe.
+type ProtectedRouteOutput<Segments, Children, ViewFn, C, PathFn> =
+    <NestedRoute<Segments, Children, (), ProtectedRouteView<ViewFn, C, PathFn>> as IntoMaybeErased>::Output;
+
+/// The view of a [`ProtectedRoute`] or a [`ProtectedParentRoute`].
+///
+/// It shows the route's view once `condition` allows it, through a `<Transition>`. When it is
+/// chosen during a navigation that waits for the new route (with `set_is_routing`), it first
+/// waits for `condition`, and creates the view right away if access is granted, so that the
+/// navigation waits for the resources the view creates too.
+#[doc(hidden)]
+#[derive(Clone)]
+pub struct ProtectedRouteView<ViewFn, C, PathFn> {
+    view: ViewFn,
+    condition: C,
+    redirect_path: PathFn,
+    fallback: children::ViewFn,
+    // a ProtectedParentRoute creates its view under the owner of its outlet,
+    // not one nested within the <Transition>, so that the context it provides
+    // reaches the views of its child routes
+    parent: bool,
+}
+
+impl<ViewFn, View, C, PathFn, P> ChooseView
+    for ProtectedRouteView<ViewFn, C, PathFn>
+where
+    ViewFn: Fn() -> View + Send + Clone + 'static,
+    View: IntoView + 'static,
+    C: Fn() -> Option<bool> + Send + Clone + 'static,
+    PathFn: Fn() -> P + Send + Clone + 'static,
+    P: Display + 'static,
+{
+    async fn choose(self) -> AnyView {
+        // a navigation waits for the resources created while the view is
+        // chosen only if it chooses it in an async transition
+        if AsyncTransition::is_active()
+            && wait_for_condition(&self.condition).await == Some(true)
         {
-            let fallback = move || fallback.run();
-            let children = children.into_inner();
-            let view = move || {
-                let condition = condition.clone();
-                let redirect_path = redirect_path.clone();
-                let fallback = fallback.clone();
-                let view = view.clone();
-                let owner = Owner::current().unwrap();
-                let view = {
-                    let fallback = fallback.clone();
-                    move || {
-                        let condition = condition();
-                        let view = view.clone();
-                        let redirect_path = redirect_path.clone();
-                        let fallback = fallback.clone();
-                        let owner = owner.clone();
-                        Unsuspend::new(move || match condition {
-                            // reset the owner so that things like providing context work
-                            // otherwise, this will be a child owner nested within the Transition, not
-                            // the parent owner of the Outlet
-                            //
-                            // clippy: not redundant, a FnOnce vs FnMut issue
-                            #[allow(clippy::redundant_closure)]
-                            Some(true) => EitherOf3::A(owner.with(|| view())),
-                            #[allow(clippy::unit_arg)]
-                            Some(false) => EitherOf3::B(
-                                view! { <Redirect path=redirect_path()/> }
-                                    .into_inner(),
-                            ),
-                            None => EitherOf3::C(fallback()),
-                        })
+            let view = self.view.clone();
+            let seed = if self.parent {
+                Seed {
+                    owner: None,
+                    view: view(),
+                }
+            } else {
+                let owner = Owner::new();
+                let view = owner.with(view);
+                Seed {
+                    owner: Some(owner),
+                    view,
+                }
+            };
+            self.seeded_view(seed)
+        } else {
+            self.into_view()
+        }
+    }
+
+    async fn preload(&self) {}
+}
+
+impl<ViewFn, View, C, PathFn, P> ProtectedRouteView<ViewFn, C, PathFn>
+where
+    ViewFn: Fn() -> View + Send + Clone + 'static,
+    View: IntoView + 'static,
+    C: Fn() -> Option<bool> + Send + Clone + 'static,
+    PathFn: Fn() -> P + Send + Clone + 'static,
+    P: Display + 'static,
+{
+    /// The route's view, which creates the protected view whenever it shows it.
+    fn into_view(self) -> AnyView {
+        let view = self.view;
+        if self.parent {
+            let owner = Owner::current().expect("no current reactive Owner");
+            guarded(
+                self.condition,
+                self.redirect_path,
+                self.fallback,
+                move || owner.with(&view),
+            )
+        } else {
+            guarded(self.condition, self.redirect_path, self.fallback, view)
+        }
+    }
+
+    /// The route's view, which shows the protected view created while it was
+    /// chosen the first time it shows the protected view.
+    fn seeded_view(self, seed: Seed<View>) -> AnyView {
+        let seed = Arc::new(SeedSlot(Mutex::new(Some(seed))));
+        let view = self.view;
+        let owner = self
+            .parent
+            .then(|| Owner::current().expect("no current reactive Owner"));
+        guarded(
+            self.condition,
+            self.redirect_path,
+            self.fallback,
+            move || {
+                match seed.take() {
+                    Some(Seed {
+                        owner: Some(owner),
+                        view,
+                    }) => {
+                        // give the view the context it would have had, had
+                        // it been created here: the resources it reads while
+                        // rendering then suspend this route's <Transition>
+                        if let Some(suspense) = use_context::<SuspenseContext>()
+                        {
+                            owner.with(|| provide_context(suspense));
+                        }
+                        // and dispose of it along with this branch, like a
+                        // view created here
+                        Owner::on_cleanup({
+                            let owner = owner.clone();
+                            move || owner.cleanup()
+                        });
+                        Either::Left(OwnedView::new_with_owner(view, owner))
                     }
-                };
-                (view! { <Transition fallback>{view}</Transition> }).into_any()
-            };
-            NestedRoute::new(path, view)
-                .ssr_mode(ssr)
-                .child(children)
-                .into_maybe_erased()
-        }
-    };
+                    Some(Seed { owner: None, view }) => Either::Right(view),
+                    None => Either::Right(match &owner {
+                        Some(owner) => owner.with(&view),
+                        None => view(),
+                    }),
+                }
+            },
+        )
+    }
 }
 
-#[cfg(erase_components)]
-define_protected_parent_route!(crate::any_nested_route::AnyNestedRoute);
-#[cfg(not(erase_components))]
-define_protected_parent_route!(NestedRoute<Segments, Children, (), impl Fn() -> AnyView + Send + Clone>);
+/// Shows `content` if `condition` is `Some(true)`, the fallback while it is
+/// `None`, and redirects to `redirect_path` if it is `Some(false)`.
+fn guarded<C, PathFn, P, Content, V>(
+    condition: C,
+    redirect_path: PathFn,
+    fallback: children::ViewFn,
+    content: Content,
+) -> AnyView
+where
+    C: Fn() -> Option<bool> + Send + Clone + 'static,
+    PathFn: Fn() -> P + Send + Clone + 'static,
+    P: Display + 'static,
+    Content: Fn() -> V + Send + Clone + 'static,
+    V: IntoView + 'static,
+{
+    let fallback = move || fallback.run();
+    (view! {
+        <Transition fallback=fallback.clone()>
+            {move || {
+                let condition = condition();
+                let content = content.clone();
+                let redirect_path = redirect_path.clone();
+                let fallback = fallback.clone();
+                Unsuspend::new(move || match condition {
+                    Some(true) => EitherOf3::A(content()),
+                    #[allow(clippy::unit_arg)]
+                    Some(false) => {
+                        EitherOf3::B(view! { <Redirect path=redirect_path()/> }.into_inner())
+                    }
+                    None => EitherOf3::C(fallback()),
+                })
+            }}
+
+        </Transition>
+    })
+    .into_any()
+}
+
+/// The protected view of a [`ProtectedRouteView`], created while it was chosen.
+struct Seed<View> {
+    // `None` for a ProtectedParentRoute, whose view is created under the
+    // owner of its outlet
+    owner: Option<Owner>,
+    view: View,
+}
+
+/// Holds a [`Seed`] until it is shown, and disposes of it if it never is.
+struct SeedSlot<View>(Mutex<Option<Seed<View>>>);
+
+impl<View> SeedSlot<View> {
+    fn take(&self) -> Option<Seed<View>> {
+        self.0.lock().or_poisoned().take()
+    }
+}
+
+impl<View> Drop for SeedSlot<View> {
+    fn drop(&mut self) {
+        if let Some(Seed {
+            owner: Some(owner), ..
+        }) = self.take()
+        {
+            owner.cleanup();
+        }
+    }
+}
+
+/// How many times [`wait_for_condition`] evaluates a condition that is waiting
+/// for resources: once it has read one that has loaded, a condition may read
+/// another one that is still loading.
+const CONDITION_ROUNDS: usize = 8;
+
+/// A separate observer keeps condition dependencies out of the router's
+/// render effect. Each evaluation drops its subscriptions and wakeup target.
+#[derive(Debug, Default)]
+struct ConditionSubscriber {
+    sources: Mutex<Vec<AnySource>>,
+    changed: AtomicBool,
+    waker: AtomicWaker,
+}
+
+impl ReactiveNode for ConditionSubscriber {
+    fn mark_dirty(&self) {
+        self.changed.store(true, Ordering::Release);
+        self.waker.wake();
+    }
+
+    fn mark_check(&self) {
+        self.mark_dirty();
+    }
+
+    fn mark_subscribers_check(&self) {
+        self.mark_dirty();
+    }
+
+    fn update_if_necessary(&self) -> bool {
+        false
+    }
+}
+
+impl Subscriber for ConditionSubscriber {
+    fn add_source(&self, source: AnySource) {
+        self.sources.lock().or_poisoned().push(source);
+    }
+
+    fn clear_sources(&self, subscriber: &AnySubscriber) {
+        for source in mem::take(&mut *self.sources.lock().or_poisoned()) {
+            source.remove_subscriber(subscriber);
+        }
+    }
+}
+
+struct ConditionWait(Arc<ConditionSubscriber>);
+
+impl ConditionWait {
+    fn subscriber(&self) -> AnySubscriber {
+        AnySubscriber(
+            Arc::as_ptr(&self.0) as usize,
+            Arc::downgrade(&self.0) as Weak<dyn Subscriber + Send + Sync>,
+        )
+    }
+}
+
+impl Drop for ConditionWait {
+    fn drop(&mut self) {
+        self.0.clear_sources(&self.subscriber());
+        self.0.waker.take();
+    }
+}
+
+// A resource can retain its suspense context after this evaluation ends.
+// Its wakeup must neither retain the wait nor wake a finished navigation.
+struct ConditionWake(Weak<ConditionSubscriber>);
+
+impl ArcWake for ConditionWake {
+    fn wake_by_ref(arc_self: &Arc<Self>) {
+        if let Some(wait) = arc_self.0.upgrade() {
+            wait.waker.wake();
+        }
+    }
+}
+
+/// Evaluates `condition`, and while it is `None` with resources still loading,
+/// evaluates it again when its dependencies change or those resources finish.
+/// After [`CONDITION_ROUNDS`] evaluations it returns `None`, leaving the guarded
+/// view to decide access without holding navigation for its content's resources.
+async fn wait_for_condition(
+    condition: &impl Fn() -> Option<bool>,
+) -> Option<bool> {
+    let disposed = Arc::new(AtomicBool::new(false));
+    Owner::on_cleanup({
+        let disposed = Arc::clone(&disposed);
+        move || disposed.store(true, Ordering::Release)
+    });
+    for _ in 0..CONDITION_ROUNDS {
+        // A previous route's owner may have disposed the condition's signals
+        // while a resource was loading.
+        if disposed.load(Ordering::Acquire) {
+            return None;
+        }
+        let wait = ConditionWait(Arc::new(ConditionSubscriber::default()));
+        // a resource read under a SuspenseContext registers a task with it
+        // until it has loaded
+        let suspense = SuspenseContext::default();
+        let owner = Owner::new();
+        let value = owner.with(|| {
+            provide_context(suspense.clone());
+            wait.subscriber().with_observer(condition)
+        });
+        owner.cleanup();
+        if value.is_some() {
+            return value;
+        }
+        let suspense_waker =
+            waker(Arc::new(ConditionWake(Arc::downgrade(&wait.0))));
+        let mut loading = false;
+        let changed = poll_fn(|cx| {
+            wait.0.waker.register(cx.waker());
+            if wait.0.changed.load(Ordering::Acquire) {
+                Poll::Ready(true)
+            } else if suspense.poll_empty(&suspense_waker) {
+                Poll::Ready(false)
+            } else {
+                loading = true;
+                Poll::Pending
+            }
+        })
+        .await;
+        if !loading && !changed {
+            return None;
+        }
+    }
+    None
+}
 
 /// Redirects the user to a new URL, whether on the client side or on the server
 /// side. If rendered on the server, this sets a `302` status code if `permanent` is false or a `301` if `permanent` is true,
@@ -710,5 +993,136 @@ pub fn RoutingProgress(
         <Show when=is_showing>
             <progress min="0" max="100" value=move || progress.get()></progress>
         </Show>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::FutureExt;
+
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl ArcWake for WakeCount {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn condition_wait_tracks_memos_without_tracking_the_caller() {
+        use std::{future::Future, task::Context};
+
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new(None::<bool>);
+        let memo = Memo::new(move |_| value.get());
+        let tasks = Mutex::new(Vec::new());
+        let condition = || {
+            let value = memo.get();
+            if value.is_none() {
+                tasks
+                    .lock()
+                    .or_poisoned()
+                    .push(use_context::<SuspenseContext>().unwrap().task_id());
+            }
+            value
+        };
+        let caller = ConditionWait(Arc::new(ConditionSubscriber::default()));
+        let wake = Arc::new(WakeCount::default());
+        let waker = waker(Arc::clone(&wake));
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = Box::pin(wait_for_condition(&condition));
+        assert!(
+            caller
+                .subscriber()
+                .with_observer(|| waiting.as_mut().poll(&mut cx))
+                .is_pending()
+        );
+        assert!(caller.0.sources.lock().or_poisoned().is_empty());
+        // A memo propagates mark_check rather than mark_dirty.
+        value.set(Some(true));
+        assert!(wake.0.load(Ordering::Relaxed) > 0);
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(Some(true)));
+        drop(waiting);
+        let wakes = wake.0.load(Ordering::Relaxed);
+        value.set(Some(false));
+        tasks.lock().or_poisoned().clear();
+        assert_eq!(wake.0.load(Ordering::Relaxed), wakes);
+        owner.cleanup();
+    }
+
+    #[test]
+    fn dropping_a_condition_wait_disconnects_sources_and_suspense() {
+        use std::{future::Future, task::Context};
+
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new(None::<bool>);
+        let tasks = Mutex::new(Vec::new());
+        let observed = Mutex::new(None);
+        let condition = || {
+            *observed.lock().or_poisoned() =
+                reactive_graph::graph::Observer::get();
+            tasks
+                .lock()
+                .or_poisoned()
+                .push(use_context::<SuspenseContext>().unwrap().task_id());
+            value.get()
+        };
+        let mut waiting = Box::pin(wait_for_condition(&condition));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        let subscriber = observed.lock().or_poisoned().clone().unwrap();
+        assert!(subscriber.1.upgrade().is_some());
+        drop(waiting);
+        assert!(subscriber.1.upgrade().is_none());
+        value.set(Some(false));
+        tasks.lock().or_poisoned().clear();
+        owner.cleanup();
+    }
+
+    #[test]
+    fn condition_wait_does_not_read_disposed_signals() {
+        use std::{future::Future, task::Context};
+
+        let owner = Owner::new();
+        owner.set();
+        let value = RwSignal::new(None::<bool>);
+        let tasks = Mutex::new(Vec::new());
+        let condition = || {
+            tasks
+                .lock()
+                .or_poisoned()
+                .push(use_context::<SuspenseContext>().unwrap().task_id());
+            value.get()
+        };
+        let mut waiting = Box::pin(wait_for_condition(&condition));
+        let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        owner.cleanup();
+        tasks.lock().or_poisoned().clear();
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(None));
+    }
+
+    /// Without a navigation that waits for the new route (with server-side
+    /// rendering, hydration or the initial load, or without `set_is_routing`),
+    /// a protected route's view is chosen at once, as it was before it could
+    /// wait for its condition.
+    #[test]
+    fn protected_route_view_is_chosen_at_once_outside_a_transition() {
+        let owner = Owner::new();
+        owner.set();
+        for parent in [false, true] {
+            let view = ProtectedRouteView {
+                view: || "content",
+                condition: || None::<bool>,
+                redirect_path: || "/",
+                fallback: children::ViewFn::default(),
+                parent,
+            };
+            assert!(view.choose().now_or_never().is_some());
+        }
     }
 }
